@@ -1,0 +1,13 @@
+{
+  "COMFYUI_BASE_URL": "http://192.168.7.101:8188",
+  "WIDTH": 1024,
+  "HEIGHT": 1024,
+  "STEPS": 20,
+  "CFG_SCALE": 5.0,
+  "NEGATIVE_PROMPT": "blurry, low quality, distorted, ugly, bad anatomy, deformed, poorly drawn, text, watermark, signature, multiple views, split screen",
+  "ENHANCE_PROMPTS": true,
+  "PROMPT_ENHANCEMENT_STYLE": "detailed",
+  "UNET_MODEL": "omnigen2_fp16.safetensors",
+  "VAE_MODEL": "ae.safetensors",
+  "CLIP_MODEL": "qwen_2.5_vl_fp16.safetensors"
+}
