@@ -17,6 +17,16 @@ from typing import List, Union, Generator, Iterator, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
 
+# Import ComfyUI Pipeline
+try:
+    import sys
+    sys.path.append('.')
+    from pipelines.comfyui_image_generator_pipeline import Pipeline as ComfyUIPipeline
+    COMFYUI_AVAILABLE = True
+except ImportError:
+    COMFYUI_AVAILABLE = False
+    print("⚠️ ComfyUI Pipeline no disponible - detección de imágenes deshabilitada")
+
 
 class Pipeline:
     class Valves(BaseModel):
@@ -76,6 +86,16 @@ CRITERIOS PARA CONSIDERAR NO CONFIDENCIAL:
             description="Registrar decisiones de seguridad en logs"
         )
         
+        # === ComfyUI Integration ===
+        COMFYUI_PIPELINE_ENABLED: bool = Field(
+            default=True,
+            description="Habilitar integración con pipeline ComfyUI para generación de imágenes"
+        )
+        COMFYUI_BASE_URL: str = Field(
+            default="http://192.168.7.101:8188",
+            description="URL base del servidor ComfyUI"
+        )
+        
         # === Advanced Settings ===
         ENABLE_STREAMING: bool = Field(
             default=True, 
@@ -94,6 +114,16 @@ CRITERIOS PARA CONSIDERAR NO CONFIDENCIAL:
         self.name = "Security Gateway"
         self.valves = self.Valves()
         self._security_log = []
+        
+        # Initialize ComfyUI pipeline if available
+        self.comfyui_pipeline = None
+        if COMFYUI_AVAILABLE and self.valves.COMFYUI_PIPELINE_ENABLED:
+            try:
+                self.comfyui_pipeline = ComfyUIPipeline()
+                print("✅ ComfyUI Pipeline cargado correctamente")
+            except Exception as e:
+                print(f"❌ Error cargando ComfyUI Pipeline: {e}")
+                self.comfyui_pipeline = None
         
     async def on_startup(self):
         """Initialize and test connections"""
@@ -175,6 +205,21 @@ CRITERIOS PARA CONSIDERAR NO CONFIDENCIAL:
             status = "🔒 CONFIDENCIAL" if is_confidential else "🌐 NO CONFIDENCIAL"
             print(f"🛡️ {status} (confianza: {confidence:.2f}) -> {'Local' if is_confidential else 'Externo'}")
 
+    def _log_image_generation_decision(self, user_message: str):
+        """Log image generation routing decisions"""
+        if self.valves.LOG_SECURITY_DECISIONS:
+            log_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "message_hash": hash(user_message) % 10000,  # Hash for privacy
+                "request_type": "image_generation",
+                "pipeline_used": "comfyui",
+                "reasoning": "Solicitud de generación de imagen detectada automáticamente"
+            }
+            self._security_log.append(log_entry)
+            
+            # Print to console for immediate visibility
+            print(f"🎨 IMAGEN DETECTADA -> ComfyUI")
+
     def _save_security_log(self):
         """Save security log to file"""
         try:
@@ -255,6 +300,92 @@ Responde ÚNICAMENTE en formato JSON:
             "reasoning": "Análisis de seguridad falló - aplicando principio de precaución (tratando como confidencial)",
             "category": "fallback-safe"
         }
+
+    def _is_image_request(self, user_message: str) -> bool:
+        """Detecta si el mensaje es una solicitud de generación de imagen"""
+        image_keywords = [
+            "genera", "crea", "dibuja", "imagen", "picture", "image", 
+            "draw", "create", "generate", "pintura", "dibujo", "foto",
+            "ilustra", "diseña", "render", "visualiza"
+        ]
+        
+        # Buscar palabras clave de imagen
+        message_lower = user_message.lower()
+        has_image_keyword = any(keyword in message_lower for keyword in image_keywords)
+        
+        # Patrones adicionales
+        image_patterns = [
+            "una imagen de",
+            "una foto de", 
+            "un dibujo de",
+            "una ilustración de",
+            "que se vea como",
+            "mostrar como imagen"
+        ]
+        
+        has_image_pattern = any(pattern in message_lower for pattern in image_patterns)
+        
+        return has_image_keyword or has_image_pattern
+
+    def _call_comfyui_pipeline(self, user_message: str, model_id: str, messages: List[dict], body: dict) -> Union[str, Generator, Iterator]:
+        """Llama al pipeline ComfyUI para generar imágenes"""
+        if not self.comfyui_pipeline:
+            return "❌ Pipeline ComfyUI no disponible. Verifique la configuración."
+        
+        try:
+            print("🎨 Enrutando a ComfyUI para generación de imagen...")
+            
+            # Agregar mensaje informativo
+            info_msg = "🎨 **Solicitud de imagen detectada**\n→ Enrutando a ComfyUI para generación\n\n"
+            
+            if body.get("stream", False):
+                def image_stream():
+                    # Primero enviar mensaje informativo
+                    yield f"data: {json.dumps({'choices': [{'delta': {'content': info_msg}}]})}\n\n"
+                    
+                    # Llamar al pipeline ComfyUI
+                    try:
+                        result = self.comfyui_pipeline.pipe(user_message, model_id, messages, body)
+                        
+                        if hasattr(result, '__iter__') and not isinstance(result, str):
+                            # Es un generador/iterador
+                            for chunk in result:
+                                if isinstance(chunk, str):
+                                    # Convertir string a formato de streaming
+                                    yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
+                                else:
+                                    yield chunk
+                        else:
+                            # Es una respuesta simple
+                            yield f"data: {json.dumps({'choices': [{'delta': {'content': str(result)}}]})}\n\n"
+                    
+                    except Exception as e:
+                        error_msg = f"❌ Error en generación de imagen: {str(e)}"
+                        yield f"data: {json.dumps({'choices': [{'delta': {'content': error_msg}}]})}\n\n"
+                
+                return image_stream()
+            else:
+                # Non-streaming
+                try:
+                    result = self.comfyui_pipeline.pipe(user_message, model_id, messages, body)
+                    
+                    if isinstance(result, str):
+                        return info_msg + result
+                    elif hasattr(result, '__iter__'):
+                        # Convertir generador a string
+                        content_parts = [info_msg]
+                        for chunk in result:
+                            if isinstance(chunk, str):
+                                content_parts.append(chunk)
+                        return "".join(content_parts)
+                    else:
+                        return info_msg + str(result)
+                        
+                except Exception as e:
+                    return info_msg + f"❌ Error en generación de imagen: {str(e)}"
+                    
+        except Exception as e:
+            return f"❌ Error llamando pipeline ComfyUI: {str(e)}"
 
     def _call_ollama(self, messages: List[dict], body: dict) -> Union[str, Generator, Iterator]:
         """Call local Ollama for confidential data"""
@@ -347,7 +478,16 @@ Responde ÚNICAMENTE en formato JSON:
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
-        """Main pipeline with security-based routing"""
+        """Main pipeline with security-based routing and image detection"""
+        
+        # Step 0: Check for image generation requests
+        if self.valves.COMFYUI_PIPELINE_ENABLED and self._is_image_request(user_message):
+            print(f"🎨 Solicitud de imagen detectada - enrutando a ComfyUI...")
+            
+            # Log image generation decision
+            self._log_image_generation_decision(user_message)
+            
+            return self._call_comfyui_pipeline(user_message, model_id, messages, body)
         
         # Step 1: Analyze confidentiality
         print(f"🛡️ Analizando confidencialidad de la consulta...")

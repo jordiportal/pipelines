@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, Depends, status, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.concurrency import run_in_threadpool
 
 
@@ -257,6 +258,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(docs_url="/docs", redoc_url=None, lifespan=lifespan)
 
 app.state.PIPELINES = PIPELINES
+
+# Montar directorio estático para servir imágenes generadas
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 origins = ["*"]

@@ -5,7 +5,7 @@ date: 2024-12-19
 version: 1.0
 license: MIT
 description: Pipeline que se conecta con ComfyUI para generar imágenes usando OmniGen2, incluye mejora de prompts y actualizaciones de estado en tiempo real.
-requirements: requests
+requirements: requests, pillow
 """
 
 import json
@@ -13,6 +13,9 @@ import time
 import uuid
 import random
 import base64
+import io
+import os
+from pathlib import Path
 from typing import List, Union, Generator, Iterator
 from pydantic import BaseModel, Field
 import requests
@@ -73,11 +76,20 @@ class Pipeline:
             default="qwen_2.5_vl_fp16.safetensors",
             description="Modelo CLIP para codificación de texto (debe existir en ComfyUI/models/clip/)"
         )
+        
+
+
+
 
     def __init__(self):
+        # Identificador único del pipeline
+        self.id = "comfyui_image_generator"
         self.name = "ComfyUI Image Generator"
         self.valves = self.Valves()
         self.client_id = str(uuid.uuid4())
+        
+        # Flag para evitar múltiples generaciones
+        self._generating = False
         
         # Cargar template de workflow
         self.workflow_template = self._load_workflow_template()
@@ -274,8 +286,10 @@ class Pipeline:
         except Exception as e:
             raise Exception(f"Error al enviar prompt a ComfyUI: {str(e)}")
 
-    def _get_image(self, filename: str, subfolder: str = "", folder_type: str = "output") -> str:
-        """Descarga la imagen generada y la convierte a base64"""
+
+
+    def _get_image_data_url(self, filename: str, subfolder: str = "", folder_type: str = "output") -> str:
+        """Descarga la imagen de ComfyUI y la convierte a data URL (sin guardar archivo)"""
         url = f"{self.valves.COMFYUI_BASE_URL}/view"
         params = {
             "filename": filename,
@@ -287,12 +301,62 @@ class Pipeline:
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             
-            # Convertir imagen directamente a base64
-            img_base64 = base64.b64encode(response.content).decode()
+            # Verificar contenido
+            image_data = response.content
+            if not image_data:
+                raise Exception("Imagen vacía recibida de ComfyUI")
             
-            return img_base64
+            # Comprimir imagen si es muy grande (>800KB)
+            if len(image_data) > 800 * 1024:  # > 800KB
+                try:
+                    compressed_data = self._compress_image_bytes(image_data)
+                    image_data = compressed_data
+                except Exception:
+                    # Si falla la compresión, usar imagen original
+                    pass
+            
+            # Crear data URL
+            content_type = response.headers.get('content-type', 'image/png')
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+            data_url = f"data:{content_type};base64,{image_base64}"
+            
+            return data_url
+            
         except Exception as e:
-            raise Exception(f"Error al descargar imagen: {str(e)}")
+            raise Exception(f"Error descargando imagen de ComfyUI: {str(e)}")
+
+    def _compress_image_bytes(self, image_data: bytes) -> bytes:
+        """Comprime datos de imagen para reducir tamaño"""
+        try:
+            from PIL import Image
+            import io
+            
+            # Abrir imagen
+            img = Image.open(io.BytesIO(image_data))
+            
+            # Redimensionar si es muy grande
+            if img.width > 768 or img.height > 768:
+                img.thumbnail((768, 768), Image.Resampling.LANCZOS)
+            
+            # Convertir a RGB si tiene transparencia
+            if img.mode in ('RGBA', 'LA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                img = background
+            
+            # Comprimir como JPEG
+            output = io.BytesIO()
+            img.save(output, format='JPEG', quality=75, optimize=True)
+            return output.getvalue()
+            
+        except ImportError:
+            # Sin PIL, devolver imagen original
+            return image_data
+        except Exception:
+            # Si hay error en la compresión, usar imagen original
+            return image_data
 
     def _monitor_progress(self, prompt_id: str) -> Generator[str, None, tuple]:
         """Monitorea el progreso de generación usando polling"""
@@ -342,22 +406,51 @@ class Pipeline:
     async def on_shutdown(self):
         print(f"on_shutdown: {__name__}")
 
+    async def on_valves_updated(self):
+        """Se ejecuta cuando las valves son actualizadas"""
+        pass
+
+    def _extract_user_message(self, message: str) -> str:
+        """Extrae el mensaje original del usuario del historial de chat si es necesario"""
+        # Si el mensaje contiene chat_history, extraer el último mensaje del usuario
+        if "chat_history" in message.lower() and "<chat_history>" in message:
+            try:
+                import re
+                user_messages = re.findall(r'USER:\s*(.+?)(?=\nASSISTANT:|$)', message, re.IGNORECASE | re.DOTALL)
+                if user_messages:
+                    return user_messages[-1].strip()
+            except Exception:
+                # Si hay error, usar mensaje original
+                pass
+        
+        return message
+
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
         """Pipeline principal para generar imágenes con ComfyUI"""
         
+        # Extraer el mensaje original del usuario del historial si es necesario
+        original_user_message = self._extract_user_message(user_message)
+        
         # Verificar si es una solicitud de generación de imagen
         image_keywords = ["genera", "crea", "dibuja", "imagen", "picture", "image", "draw", "create", "generate"]
-        is_image_request = any(keyword in user_message.lower() for keyword in image_keywords)
+        is_image_request = any(keyword in original_user_message.lower() for keyword in image_keywords)
         
         if not is_image_request:
             return "Por favor, solicita la generación de una imagen usando palabras como 'genera', 'crea' o 'dibuja una imagen de...'."
 
+        # Evitar múltiples generaciones simultáneas
+        if self._generating:
+            return "⚠️ Ya hay una generación de imagen en progreso. Espera a que termine."
+
         def generate_image():
             try:
+                # Marcar como generando
+                self._generating = True
+
                 # Extraer el prompt de la descripción
-                prompt = user_message
+                prompt = original_user_message
                 for keyword in ["genera una imagen de", "crea una imagen de", "dibuja", "genera", "crea"]:
                     if keyword in prompt.lower():
                         prompt = prompt.lower().replace(keyword, "").strip()
@@ -386,15 +479,50 @@ class Pipeline:
                 filename, subfolder = self._poll_for_completion(prompt_id)
                 
                 # Descargar imagen
-                yield "📥 Descargando imagen generada..."
-                image_base64 = self._get_image(filename, subfolder)
+                yield "📥 Descargando imagen de ComfyUI..."
                 
-                # Mostrar imagen en formato markdown
-                image_md = f"![Imagen generada]( data:image/png;base64,{image_base64})"
-                
-                yield f"✅ ¡Imagen generada exitosamente!\n\n{image_md}\n\n📋 **Detalles:**\n- Prompt original: {user_message}\n- Prompt mejorado: {self._enhance_prompt(prompt)}\n- Dimensiones: {self.valves.WIDTH}x{self.valves.HEIGHT}\n- Pasos: {self.valves.STEPS}\n- CFG Scale: {self.valves.CFG_SCALE}"
+                try:
+                    # Crear data URL directamente (incluye compresión automática)
+                    data_url = self._get_image_data_url(filename, subfolder)
+                    
+                    # Generar prompt mejorado
+                    enhanced_prompt = self._enhance_prompt(prompt)
+                    
+                    # Emitir mensaje de éxito
+                    yield "🎉 ¡Imagen generada exitosamente!"
+                    
+                    # Mostrar imagen
+                    yield f"![Imagen generada]({data_url})"
+                    
+                    # Emitir detalles
+                    details_message = f"""📋 **Detalles de la generación:**
+- **Prompt original:** {original_user_message}
+- **Prompt mejorado:** {enhanced_prompt}
+- **Dimensiones:** {self.valves.WIDTH}x{self.valves.HEIGHT}
+- **Pasos:** {self.valves.STEPS}
+- **CFG Scale:** {self.valves.CFG_SCALE}
+- **Tamaño de imagen:** {len(data_url):,} caracteres"""
+                    
+                    yield details_message
+                    
+                    # Finalizar generación exitosa
+                    self._generating = False
+                    return
+                    
+                except Exception as img_error:
+                    yield f"❌ Error procesando imagen: {str(img_error)}"
+                    yield f"📊 Información de debug: filename='{filename}', subfolder='{subfolder}'"
+                    # Intentar mostrar al menos los detalles sin imagen
+                    enhanced_prompt = self._enhance_prompt(prompt)
+                    yield f"""📋 **Detalles de la generación (sin imagen):**
+- **Prompt original:** {original_user_message}
+- **Prompt mejorado:** {enhanced_prompt}
+- **Error:** {str(img_error)}"""
                 
             except Exception as e:
                 yield f"❌ Error generando imagen: {str(e)}\n\n**Posibles soluciones:**\n- Verificar que ComfyUI esté ejecutándose en {self.valves.COMFYUI_BASE_URL}\n- Comprobar que los modelos estén disponibles\n- Revisar la configuración de valves"
+            finally:
+                # Siempre limpiar el flag de generación
+                self._generating = False
 
         return generate_image()
